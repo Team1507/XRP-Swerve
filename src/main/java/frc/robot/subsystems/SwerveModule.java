@@ -8,6 +8,10 @@ import frc.robot.util.Vector2D;
 // Constants
 import static frc.robot.Constants.SwerveConstants.*;
 
+import edu.wpi.first.math.geometry.Rotation2d;
+import edu.wpi.first.math.kinematics.SwerveModulePosition;
+import edu.wpi.first.math.kinematics.SwerveModuleState;
+
 /**
  * Represents a single differential swerve module consisting of:
  *  - Upper motor + encoder
@@ -33,6 +37,10 @@ public class SwerveModule {
     private double moveComponent = 0.0;
     private double pivotComponent = 0.0;
 
+    private int lastUpperTicks = 0;
+    private int lastLowerTicks = 0;
+    private double lastTimestamp = 0.0;
+
     /**
      * Creates a new differential swerve module.
      * @param upperMotor motor controlling one side of the differential
@@ -53,8 +61,15 @@ public class SwerveModule {
     }
 
     /**
-     * Computes the current azimuth angle of the module in degrees.
-     * The angle is derived from the combined encoder counts.
+     * Computes the current steering angle of the module.
+     *
+     * Differential swerve uses the SUM of the two encoder counts
+     * to represent the pivot angle. The difference between them
+     * represents wheel drive.
+     *
+     * This method is only used on real hardware. In simulation,
+     * getModulePosition() overrides the angle with simAngle.
+     * 
      * @return module steering angle in degrees
      */
     private double getAzimuthDegrees() {
@@ -157,6 +172,62 @@ public class SwerveModule {
         else {
             pivotComponent = computePivotPower(getAzimuthDegrees());
         }
+    }
+
+    /**
+     * Returns the current module position for odometry.
+     * Uses the average encoder counts as driven distance.
+     * @return module position (distance + angle)
+     */
+    public SwerveModulePosition getModulePosition() {
+        int upperTicks = upperEncoder.getCounts();
+        int lowerTicks = lowerEncoder.getCounts();
+        Rotation2d angle = Rotation2d.fromDegrees(getAzimuthDegrees());
+        
+        
+        double driveTicks = (upperTicks + lowerTicks) / 2.0;
+        double driveMeters = driveTicks * METERS_PER_TICK;
+
+        return new SwerveModulePosition(driveMeters, angle);
+    }
+
+    /**
+     * Returns the current module state (speed + angle).
+     * Speed is computed from encoder delta / dt because XRP encoders
+     * do not provide velocity directly.
+     */
+    public SwerveModuleState getModuleState() {
+        double now = edu.wpi.first.wpilibj.Timer.getFPGATimestamp();
+
+        int upperTicks = upperEncoder.getCounts();
+        int lowerTicks = lowerEncoder.getCounts();        
+    
+        double dt = now - lastTimestamp;
+        if (dt > 0.1) dt = 0.1; // prevent huge velocity spikes after pauses
+    
+        // Compute drive velocity from encoder deltas
+        double deltaUpper = upperTicks - lastUpperTicks;
+        double deltaLower = lowerTicks - lastLowerTicks;
+    
+        double driveTicks = (deltaUpper + deltaLower) / 2.0;
+        double driveMetersPerSec = (driveTicks * METERS_PER_TICK) / dt;
+    
+        // Update history
+        lastUpperTicks = upperTicks;
+        lastLowerTicks = lowerTicks;
+        lastTimestamp = now;
+    
+        // Module angle from azimuth
+        Rotation2d angle = Rotation2d.fromDegrees(getAzimuthDegrees());
+    
+        return new SwerveModuleState(driveMetersPerSec, angle);
+    }    
+
+    public SwerveModuleState getTargetState() {
+        return new SwerveModuleState(
+            moveComponent * MAX_SPEED_METERS_PER_SECOND,   // scale if needed
+            Rotation2d.fromDegrees(getAzimuthDegrees())
+        );
     }
 
     /**

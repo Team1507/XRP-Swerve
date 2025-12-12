@@ -7,13 +7,20 @@ import edu.wpi.first.wpilibj2.command.SubsystemBase;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.math.geometry.Pose2d;
 import edu.wpi.first.math.geometry.Rotation2d;
+import edu.wpi.first.math.geometry.Translation2d;
 import edu.wpi.first.math.Matrix;
 import edu.wpi.first.math.numbers.N1;
 import edu.wpi.first.math.numbers.N3;
+import edu.wpi.first.math.kinematics.ChassisSpeeds;
+import edu.wpi.first.math.kinematics.SwerveDriveKinematics;
+import edu.wpi.first.math.kinematics.SwerveModulePosition;
+import edu.wpi.first.math.kinematics.SwerveModuleState;
+import edu.wpi.first.math.estimator.SwerveDrivePoseEstimator;
 
 // CTRE Request Types
 import com.ctre.phoenix6.swerve.SwerveRequest;
 
+import edu.wpi.first.wpilibj.Timer;
 // XRP Sensors
 import edu.wpi.first.wpilibj.xrp.XRPGyro;
 
@@ -35,12 +42,26 @@ import frc.robot.util.ModuleKinematics;
 import static frc.robot.Constants.SwerveConstants.*;
 
 /**
- * Differential swerve drivetrain for the XRP robot.
- * Provides a high-level control interface using swerve-style requests.
+ * Differential swerve module for the XRP robot.
+ *
+ * This module abstracts:
+ *  - Differential steering (upper/lower motor difference)
+ *  - Wheel drive (upper/lower motor average)
+ *  - Shortest-path steering with automatic wheel reversal
+ *  - Odometry position (distance + angle)
+ *  - Odometry velocity (computed from encoder deltas)
+ *  - Simulation hooks for encoder ticks + module angle
+ *
+ * The goal is to match the API of a CTRE swerve module so that
+ * higher-level FRC code (Telemetry, autos, PathPlanner) works
+ * without modification.
  */
-public class SwerveDrivetrain extends SubsystemBase {
+public class CommandSwerveDrivetrain extends SubsystemBase {
 
+    // Stored for future remote features (diagnostics, resets, SysId, etc.)
+    // Remote adapters capture xrpB internally, so drivetrain does not call it directly.
     private final XRPBSubsystem xrpB;
+
     private final XRPGyro gyro = new XRPGyro();
 
     private final SwerveModule frontLeft;
@@ -48,11 +69,41 @@ public class SwerveDrivetrain extends SubsystemBase {
     private final SwerveModule backLeft;
     private final SwerveModule backRight;
 
+    // -------------------------------------------------------------------------
+    // Kinematics and Odometry
+    // -------------------------------------------------------------------------
+
+    /**
+     * Kinematics describing the location of each swerve module
+     * relative to the robot center.
+     */
+    private final SwerveDriveKinematics kinematics;
+
+    /**
+     * Pose estimator that fuses gyro and module encoder data to
+     * track the robot pose over time.
+     */
+    private final SwerveDrivePoseEstimator poseEstimator;
+
+    /**
+     * Cached module positions used for odometry updates.
+     * Order: frontLeft, frontRight, backLeft, backRight
+     */
+    private final SwerveModulePosition[] modulePositions = new SwerveModulePosition[4];
+
+    // CTRE-compatible telemetry fields
+    private ChassisSpeeds currentChassisSpeeds = new ChassisSpeeds();
+    private final SwerveModuleState[] moduleStates = new SwerveModuleState[4];
+    private final SwerveModuleState[] moduleTargets = new SwerveModuleState[4];
+    private double lastOdometryTimestamp = 0.0;
+    private double odometryPeriodSeconds = 0.0;
+    private java.util.function.Consumer<SwerveDriveState> telemetryFunction = null;
+
     /**
      * Constructs the drivetrain and initializes all four swerve modules.
      * @param xrpB reference to the XRP-B subsystem for remote motors/encoders
      */
-    public SwerveDrivetrain(XRPBSubsystem xrpB) {
+    public CommandSwerveDrivetrain(XRPBSubsystem xrpB) {
         this.xrpB = xrpB;
 
         // -------------------------
@@ -106,6 +157,30 @@ public class SwerveDrivetrain extends SubsystemBase {
         EncoderInterface blLowerEnc = new RemoteEncoderAdapter(xrpB, BACK_LEFT_LOWER_REMOTE_ENCODER);
 
         backLeft = new SwerveModule(blUpperMotor, blLowerMotor, blUpperEnc, blLowerEnc);
+
+        // -------------------------
+        // Kinematics and Pose Estimator Setup
+        // -------------------------
+
+        kinematics = new SwerveDriveKinematics(
+            new Translation2d(+WHEELBASE / 2.0, +TRACKWIDTH / 2.0),  // frontLeft
+            new Translation2d(+WHEELBASE / 2.0, -TRACKWIDTH / 2.0),  // frontRight
+            new Translation2d(-WHEELBASE / 2.0, +TRACKWIDTH / 2.0),  // backLeft
+            new Translation2d(-WHEELBASE / 2.0, -TRACKWIDTH / 2.0)   // backRight
+        );
+
+        // Start with all modules at zero distance and angle
+        modulePositions[0] = new SwerveModulePosition(0.0, new Rotation2d());
+        modulePositions[1] = new SwerveModulePosition(0.0, new Rotation2d());
+        modulePositions[2] = new SwerveModulePosition(0.0, new Rotation2d());
+        modulePositions[3] = new SwerveModulePosition(0.0, new Rotation2d());
+
+        poseEstimator = new SwerveDrivePoseEstimator(
+            kinematics,
+            getHeading(),
+            modulePositions,
+            new Pose2d()
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -137,10 +212,20 @@ public class SwerveDrivetrain extends SubsystemBase {
     }
 
     /**
-     * Resets the gyro heading to zero for field-relative driving.
+     * Telemetry mapping
+     * @param func
+     */
+    public void registerTelemetry(java.util.function.Consumer<SwerveDriveState> func) {
+        telemetryFunction = func;
+    }
+
+    /**
+     * Resets the gyro heading and pose estimator to zero heading.
      */
     public void seedFieldCentric() {
-        gyro.reset();
+        // Refresh module positions before resetting pose
+        updateModulePositions();
+        poseEstimator.resetPosition(getHeading(), modulePositions, new Pose2d());
     }
 
     // -------------------------------------------------------------------------
@@ -154,6 +239,7 @@ public class SwerveDrivetrain extends SubsystemBase {
      * @param omega rotational velocity
      */
     private void applyChassisSpeeds(double vx, double vy, double omega) {
+        currentChassisSpeeds = new ChassisSpeeds(vx, vy, omega);
 
         Vector2D translation = ModuleKinematics.computeModuleVector(vx, vy);
 
@@ -182,11 +268,12 @@ public class SwerveDrivetrain extends SubsystemBase {
 
     /**
      * Returns the current robot heading as a Rotation2d.
+     * XRPGyro returns a Rotation2d directly; no offset applied here.
      * @return heading angle
      */
     public Rotation2d getHeading() {
-        return gyro.getRotation2d();
-    }
+        return gyro.getRotation2d();   
+    }    
 
     /**
      * Returns the current robot heading in degrees.
@@ -197,11 +284,11 @@ public class SwerveDrivetrain extends SubsystemBase {
     }
 
     /**
-     * Returns the current estimated robot pose.
+     * Returns the current estimated robot pose from the pose estimator.
      * @return robot pose
      */
     public Pose2d getPose() {
-        return new Pose2d();
+        return poseEstimator.getEstimatedPosition();
     }
 
     /**
@@ -209,7 +296,30 @@ public class SwerveDrivetrain extends SubsystemBase {
      */
     public static class SwerveDriveState {
         public final Pose2d Pose;
-        public SwerveDriveState(Pose2d pose) { this.Pose = pose; }
+        public final ChassisSpeeds Speeds;
+        public final SwerveModuleState[] ModuleStates;
+        public final SwerveModuleState[] ModuleTargets;
+        public final SwerveModulePosition[] ModulePositions;
+        public final double Timestamp;
+        public final double OdometryPeriod;
+
+        public SwerveDriveState(
+            Pose2d pose,
+            ChassisSpeeds speeds,
+            SwerveModuleState[] moduleStates,
+            SwerveModuleState[] moduleTargets,
+            SwerveModulePosition[] modulePositions,
+            double timestamp,
+            double odometryPeriod
+        ) {
+            Pose = pose;
+            Speeds = speeds;
+            ModuleStates = moduleStates;
+            ModuleTargets = moduleTargets;
+            ModulePositions = modulePositions;
+            Timestamp = timestamp;
+            OdometryPeriod = odometryPeriod;
+        }
     }
 
     /**
@@ -217,7 +327,30 @@ public class SwerveDrivetrain extends SubsystemBase {
      * @return drivetrain state
      */
     public SwerveDriveState getState() {
-        return new SwerveDriveState(getPose());
+        return new SwerveDriveState(
+            getPose(),
+            currentChassisSpeeds,
+            moduleStates,
+            moduleTargets,
+            modulePositions,
+            Timer.getFPGATimestamp(),
+            odometryPeriodSeconds
+        );
+    }
+    
+    // -------------------------------------------------------------------------
+    // Odometry Helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Updates the cached module positions based on encoder counts.
+     * Each module position stores driven distance and current steering angle.
+     */
+    private void updateModulePositions() {
+        modulePositions[0] = frontLeft.getModulePosition();
+        modulePositions[1] = frontRight.getModulePosition();
+        modulePositions[2] = backLeft.getModulePosition();
+        modulePositions[3] = backRight.getModulePosition();
     }
 
     // -------------------------------------------------------------------------
@@ -227,23 +360,30 @@ public class SwerveDrivetrain extends SubsystemBase {
     /**
      * Adds a vision-based pose measurement.
      * @param pose measured pose
-     * @param timestamp measurement timestamp
+     * @param timestamp measurement timestamp (seconds)
      */
-    public void addVisionMeasurement(Pose2d pose, double timestamp) {}
+    public void addVisionMeasurement(Pose2d pose, double timestamp) {
+        poseEstimator.addVisionMeasurement(pose, timestamp);
+    }
 
     /**
      * Adds a vision-based pose measurement with standard deviations.
      * @param pose measured pose
-     * @param timestamp measurement timestamp
+     * @param timestamp measurement timestamp (seconds)
      * @param stdDevs measurement noise
      */
-    public void addVisionMeasurement(Pose2d pose, double timestamp, Matrix<N3,N1> stdDevs) {}
+    public void addVisionMeasurement(Pose2d pose, double timestamp, Matrix<N3,N1> stdDevs) {
+        poseEstimator.addVisionMeasurement(pose, timestamp, stdDevs);
+    }
 
     /**
      * Sets the forward direction used for field-relative driving.
      * @param forward the forward direction
      */
-    public void setOperatorPerspectiveForward(Rotation2d forward) {}
+    public void setOperatorPerspectiveForward(Rotation2d forward) {
+        // For a simple XRP robot, this can be left empty or used to
+        // adjust heading offsets if you add that feature later.
+    }
 
     /**
      * Runs a quasistatic system identification routine.
@@ -259,24 +399,44 @@ public class SwerveDrivetrain extends SubsystemBase {
         return run(() -> {});
     }
 
-    /**
-     * Simulation update hook.
-     */
-    @Override
-    public void simulationPeriodic() {}
-
     // -------------------------------------------------------------------------
     // Periodic Update
     // -------------------------------------------------------------------------
 
     /**
-     * Updates all swerve modules each scheduler cycle.
+     * Updates odometry and all swerve modules each scheduler cycle.
      */
     @Override
     public void periodic() {
+        double now = Timer.getFPGATimestamp();
+        odometryPeriodSeconds = now - lastOdometryTimestamp;
+        lastOdometryTimestamp = now;
+
+        // Update module positions from encoder counts
+        updateModulePositions();
+
+        // Update pose estimator using latest gyro + module positions
+        poseEstimator.update(getHeading(), modulePositions);
+
+        // Drive modules using last set targets
         frontLeft.update();
         frontRight.update();
         backLeft.update();
         backRight.update();
+
+        moduleTargets[0] = frontLeft.getTargetState();
+        moduleTargets[1] = frontRight.getTargetState();
+        moduleTargets[2] = backLeft.getTargetState();
+        moduleTargets[3] = backRight.getTargetState();
+
+        moduleStates[0] = frontLeft.getModuleState();
+        moduleStates[1] = frontRight.getModuleState();
+        moduleStates[2] = backLeft.getModuleState();
+        moduleStates[3] = backRight.getModuleState();
+
+        // Telemetry
+        if (telemetryFunction != null) {
+            telemetryFunction.accept(getState());
+        }        
     }
 }
