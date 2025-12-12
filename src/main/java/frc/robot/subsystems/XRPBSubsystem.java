@@ -3,15 +3,16 @@
 // the WPILib BSD license file in the root directory of this project.
 
 package frc.robot.subsystems;
+import edu.wpi.first.wpilibj.I2C;
 // WPI Lib
 import edu.wpi.first.wpilibj.SerialPort;
+import edu.wpi.first.wpilibj.Timer;
+import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import edu.wpi.first.wpilibj2.command.SubsystemBase;
 // Constants
 import static frc.robot.Constants.XRPBConstants.*;
 
 public class XRPBSubsystem extends SubsystemBase {
-
-    private final SerialPort uart;
 
     private double m0 = 0;
     private double m1 = 0;
@@ -23,21 +24,61 @@ public class XRPBSubsystem extends SubsystemBase {
     private int enc2 = 0;
     private int enc3 = 0;
 
+    private static final int I2C_ADDRESS = 0x20;
+
+    private final I2C i2c;
+    private int heartbeat = 0;
+    private double lastHeartbeatTime = 0.0;
+
     public XRPBSubsystem() {
-        uart = new SerialPort(BAUD_RATE, SerialPort.Port.kUSB);
-        uart.setTimeout(TIMEOUT);
-        uart.setWriteBufferMode(SerialPort.WriteBufferMode.kFlushOnAccess);
+        i2c = new I2C(I2C.Port.kOnboard, I2C_ADDRESS);
+        System.out.println("XRPBSubsystem: I2C device initialized at 0x20");
     }
+
+    private void readHeartbeat() {
+        byte[] buffer = new byte[4];
+    
+        // Combined write-then-read: set register pointer to 0x20, then read 4 bytes
+        boolean fail = i2c.transaction(
+            new byte[] { (byte) 0x20 }, // write: register address
+            1,                          // write length
+            buffer,                     // read buffer
+            4                           // read length
+        );
+    
+        if (fail) {
+            System.out.println("I2C transaction failed");
+            return;
+        }
+    
+        // Log the raw bytes
+        System.out.printf("HB bytes: %02X %02X %02X %02X%n",
+            buffer[0], buffer[1], buffer[2], buffer[3]);
+    
+        // For this test, just treat heartbeat as the first byte
+        int hb = buffer[0] & 0xFF;
+        heartbeat = hb;
+        lastHeartbeatTime = Timer.getFPGATimestamp();
+    }    
+
+    public int getHeartbeat() {
+        return heartbeat;
+    }
+
+    public boolean isAlive() {
+        return (Timer.getFPGATimestamp() - lastHeartbeatTime) < 0.5;
+    }
+
 
     /** Send motor efforts to XRP B */
     public void sendMotorEfforts(double m0, double m1, double m2, double m3) {
         String packet = String.format(FORMAT, m0, m1, m2, m3);
-        uart.writeString(packet);
+        //uart.writeString(packet);
     }
 
     /** Read encoder packet from XRP B */
     private void readEncoderPacket() {
-        String line = uart.readString();
+        String line = "null"; //uart.readString();
 
         if (line == null || line.isEmpty()) {
             return;
@@ -58,6 +99,9 @@ public class XRPBSubsystem extends SubsystemBase {
             enc1 = Integer.parseInt(parts[1]);
             enc2 = Integer.parseInt(parts[2]);
             enc3 = Integer.parseInt(parts[3]);
+
+            heartbeat = Integer.parseInt(parts[4]);
+            lastHeartbeatTime = Timer.getFPGATimestamp();
         } catch (Exception e) {
             // Ignore malformed packets
         }
@@ -65,7 +109,13 @@ public class XRPBSubsystem extends SubsystemBase {
 
     @Override
     public void periodic() {
-        readEncoderPacket();
+        readHeartbeat();
+
+        double age = Timer.getFPGATimestamp() - lastHeartbeatTime;
+
+        SmartDashboard.putNumber("XRPB Heartbeat", heartbeat);
+        SmartDashboard.putNumber("XRPB Packet Age", age);
+        SmartDashboard.putBoolean("XRPB Link OK", age < 0.25);
     }
 
     public int getRemoteEncoder(int index) {
